@@ -230,6 +230,29 @@ input:focus{border-color:var(--accent)}
   .logo{display:none}
   #ticker-input{width:80px}
 }
+
+/* ── Autocomplete ── */
+.ac-wrap{position:relative;display:flex;align-items:center;gap:8px}
+.ac-dropdown{
+  position:absolute;top:calc(100% + 4px);left:0;
+  min-width:280px;z-index:100;
+  background:var(--bg2);border:0.5px solid var(--border2);
+  border-radius:var(--r);overflow:hidden;
+  box-shadow:0 8px 24px rgba(0,0,0,.5);
+}
+.ac-item{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 12px;cursor:pointer;
+  transition:background .1s;
+  border-bottom:0.5px solid var(--border);
+}
+.ac-item:last-child{border-bottom:none}
+.ac-item:hover,.ac-item.selected{background:var(--bg3)}
+.ac-ticker{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent);min-width:70px}
+.ac-name{font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px}
+.ac-exch{font-size:10px;color:var(--text3);font-family:var(--mono);margin-left:auto;flex-shrink:0}
+.ac-loading{padding:10px 12px;font-size:12px;color:var(--text3);font-family:var(--mono)}
+.ac-empty{padding:10px 12px;font-size:12px;color:var(--text3)}
 </style>
 </head>
 <body>
@@ -238,9 +261,14 @@ input:focus{border-color:var(--accent)}
   <!-- Topbar -->
   <div class="topbar">
     <span class="logo">~ EW</span>
-    <input id="ticker-input" value="AAPL" placeholder="Ticker / ISIN"
-      autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" onfocus="this.select()"/>
-    <button class="btn-load" id="load-btn" onclick="loadData()">Laden</button>
+    <div class="ac-wrap" id="ac-wrap">
+      <input id="ticker-input" value="AAPL" placeholder="Suche: Name, Ticker oder ISIN"
+        autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+        onfocus="this.select()" oninput="onTickerInput(this.value)" onkeydown="onTickerKey(event)"
+        style="width:220px"/>
+      <button class="btn-load" id="load-btn" onclick="loadData()">Laden</button>
+      <div class="ac-dropdown" id="ac-dropdown" style="display:none"></div>
+    </div>
     <div class="topbar-spacer"></div>
   </div>
 
@@ -369,40 +397,109 @@ function isISIN(val){
   return /^[A-Z]{2}[A-Z0-9]{10}$/.test(val.trim());
 }
 
-async function isinToTicker(isin){
-  // Yahoo Finance search API - same proxy as chart data
-  const searchUrl='https://query1.finance.yahoo.com/v1/finance/search?q='
-    +encodeURIComponent(isin)+'&quotesCount=5&newsCount=0&enableFuzzyQuery=false';
+/* ── Autocomplete ── */
+let acTimer=null, acIdx=-1, acResults=[];
 
+async function searchYF(q){
+  const url='https://query1.finance.yahoo.com/v1/finance/search?q='
+    +encodeURIComponent(q)+'&quotesCount=8&newsCount=0&enableFuzzyQuery=true&quotesQueryId=tss_match_phrase_query';
   const proxies=[
-    'https://api.allorigins.win/raw?url='+encodeURIComponent(searchUrl),
-    'https://corsproxy.io/?'+encodeURIComponent(searchUrl),
-    'https://thingproxy.freeboard.io/fetch/'+searchUrl,
+    'https://api.allorigins.win/raw?url='+encodeURIComponent(url),
+    'https://corsproxy.io/?'+encodeURIComponent(url),
   ];
-
-  let lastErr='Suche fehlgeschlagen';
   for(let i=0;i<proxies.length;i++){
     try{
-      const res=await fetch(proxies[i],{signal:AbortSignal.timeout(10000)});
-      if(!res.ok){lastErr='HTTP '+res.status;continue;}
+      const res=await fetch(proxies[i],{signal:AbortSignal.timeout(6000)});
+      if(!res.ok) continue;
       const txt=await res.text();
-      if(!txt||txt.trim()[0]!=='{'){lastErr='Kein JSON vom Proxy';continue;}
+      if(!txt||txt.trim()[0]!=='{') continue;
       const json=JSON.parse(txt);
-      const quotes=json&&json.quotes;
-      if(!quotes||!quotes.length){
-        lastErr='Keine Ergebnisse für diese ISIN';
-        continue;
-      }
-      // Prefer XETRA (exchange: GER or XETRA), then any equity
-      const xetra=quotes.find(q=>q.exchDisp==='XETRA'||q.exchange==='GER'||q.exchange==='XETR'||(q.symbol&&q.symbol.endsWith('.DE')));
-      const equity=quotes.find(q=>q.quoteType==='EQUITY');
-      const best=xetra||equity||quotes[0];
-      if(!best||!best.symbol) throw new Error('Kein Ticker gefunden');
-      return{ticker:best.symbol,name:best.longname||best.shortname||isin};
-    }catch(e){lastErr=e.message;}
+      return (json.quotes||[]).filter(q=>q.symbol&&q.quoteType!=='OPTION'&&q.quoteType!=='FUTURE');
+    }catch(_){}
   }
-  throw new Error(lastErr+'. Bitte Ticker direkt eingeben (z.B. BMW.DE).');
+  return [];
 }
+
+function onTickerInput(val){
+  clearTimeout(acTimer);
+  const v=val.trim();
+  if(!v||v.length<1){closeAC();return;}
+  // Show loading indicator after short delay
+  acTimer=setTimeout(async()=>{
+    showACLoading();
+    const results=await searchYF(v);
+    acResults=results;
+    acIdx=-1;
+    renderAC(results);
+  }, 250);
+}
+
+function showACLoading(){
+  const dd=document.getElementById('ac-dropdown');
+  dd.style.display='block';
+  dd.innerHTML='<div class="ac-loading">Suche…</div>';
+}
+
+function renderAC(results){
+  const dd=document.getElementById('ac-dropdown');
+  if(!results.length){
+    dd.innerHTML='<div class="ac-empty">Keine Ergebnisse</div>';
+    dd.style.display='block';
+    return;
+  }
+  dd.innerHTML=results.map((r,i)=>{
+    const name=(r.longname||r.shortname||'').slice(0,30);
+    const exch=r.exchDisp||r.exchange||'';
+    return '<div class="ac-item" data-idx="'+i+'" onmousedown="selectAC('+i+')">'
+      +'<span class="ac-ticker">'+r.symbol+'</span>'
+      +'<span class="ac-name">'+name+'</span>'
+      +'<span class="ac-exch">'+exch+'</span>'
+      +'</div>';
+  }).join('');
+  dd.style.display='block';
+}
+
+function selectAC(idx){
+  const r=acResults[idx];
+  if(!r) return;
+  document.getElementById('ticker-input').value=r.symbol;
+  closeAC();
+  loadData();
+}
+
+function closeAC(){
+  document.getElementById('ac-dropdown').style.display='none';
+  acIdx=-1;
+}
+
+function onTickerKey(e){
+  const dd=document.getElementById('ac-dropdown');
+  const items=dd.querySelectorAll('.ac-item');
+  if(e.key==='ArrowDown'){
+    e.preventDefault();
+    acIdx=Math.min(acIdx+1,items.length-1);
+    items.forEach((el,i)=>el.classList.toggle('selected',i===acIdx));
+  }else if(e.key==='ArrowUp'){
+    e.preventDefault();
+    acIdx=Math.max(acIdx-1,0);
+    items.forEach((el,i)=>el.classList.toggle('selected',i===acIdx));
+  }else if(e.key==='Enter'){
+    if(acIdx>=0&&items[acIdx]){
+      e.preventDefault();
+      selectAC(acIdx);
+    }else{
+      closeAC();
+      loadData();
+    }
+  }else if(e.key==='Escape'){
+    closeAC();
+  }
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('mousedown',e=>{
+  if(!document.getElementById('ac-wrap').contains(e.target)) closeAC();
+});
 
 /* ── Fetch (Yahoo Finance via proxy) ── */
 async function fetchYF(ticker,range){
@@ -449,29 +546,20 @@ async function fetchYF(ticker,range){
 
 /* ── Load ── */
 async function loadData(){
+  closeAC();
   const raw=document.getElementById('ticker-input').value.trim().toUpperCase();
   if(!raw) return;
   document.getElementById('load-btn').disabled=true;
-  showSpin(true,'Lade Daten…');hideErr();
+  showSpin(true,'Lade '+raw+'…');hideErr();
   document.getElementById('sdot').className='sdot loading';
-  let t=raw;
+  document.getElementById('stext').textContent='Lade '+raw+'…';
+  S.ticker=raw; S.data=[]; S.wave=null;
   try{
-    if(isISIN(raw)){
-      showSpin(true,'ISIN wird aufgelöst…');
-      document.getElementById('stext').textContent='ISIN wird aufgelöst…';
-      const resolved=await isinToTicker(raw);
-      t=resolved.ticker;
-      document.getElementById('ticker-input').value=t;
-      showSpin(true,'Lade '+t+'…');
-    }
-    document.getElementById('stext').textContent='Lade '+t+'…';
-    S.ticker=t; S.data=[]; S.wave=null;
-    const{candles,meta}=await fetchYF(t,S.range);
+    const{candles,meta}=await fetchYF(raw,S.range);
     S.data=candles; S.meta=meta;
-    if(isISIN(raw)) S.meta.isin=raw;
     recompute();
   }catch(e){
-    showErr(isISIN(raw)?'ISIN nicht gefunden':'Ticker nicht gefunden',e.message);
+    showErr('Nicht gefunden',e.message);
     document.getElementById('sdot').className='sdot';
     document.getElementById('stext').textContent='Fehler — Eingabe prüfen';
   }finally{
