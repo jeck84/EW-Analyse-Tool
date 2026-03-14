@@ -368,29 +368,46 @@ function updateRangeUI(){
 }
 
 /* ── Fetch ── */
+async function safeJSON(res){
+  var text=await res.text();
+  if(!text||text.trim()[0]!=='{' && text.trim()[0]!=='[')
+    throw new Error('Proxy hat keine JSON-Daten geliefert');
+  return JSON.parse(text);
+}
+
 async function fetchYF(ticker,range){
-  const iv=IV[range]||'1d';
-  const yfUrl='https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(ticker.toUpperCase())+'?range='+range+'&interval='+iv+'&includePrePost=false';
-  const proxies=[
-    function(u){return 'https://api.allorigins.win/raw?url='+encodeURIComponent(u);},
-    function(u){return 'https://corsproxy.io/?'+encodeURIComponent(u);},
-    function(u){return 'https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(u);},
+  var iv=IV[range]||'1d';
+  var yfUrl='https://query1.finance.yahoo.com/v8/finance/chart/'
+    +encodeURIComponent(ticker.toUpperCase())
+    +'?range='+range+'&interval='+iv+'&includePrePost=false';
+
+  var urls=[
+    'https://api.allorigins.win/raw?url='+encodeURIComponent(yfUrl),
+    'https://corsproxy.io/?'+encodeURIComponent(yfUrl),
+    'https://thingproxy.freeboard.io/fetch/'+yfUrl,
   ];
-  var lastErr='Keine Verbindung möglich';
-  for(var pi=0;pi<proxies.length;pi++){
+
+  var lastErr='Alle Proxies fehlgeschlagen';
+  for(var i=0;i<urls.length;i++){
     try{
-      var res=await fetch(proxies[pi](yfUrl),{signal:AbortSignal.timeout(12000)});
+      var res=await fetch(urls[i],{signal:AbortSignal.timeout(13000)});
       if(!res.ok){lastErr='HTTP '+res.status;continue;}
-      var json=JSON.parse(await res.text());
+      var json=await safeJSON(res);
       var result=json&&json.chart&&json.chart.result&&json.chart.result[0];
-      if(!result){lastErr='Ticker nicht gefunden. Bitte prüfen.';continue;}
+      if(!result){
+        var err=json&&json.chart&&json.chart.error;
+        lastErr=err&&err.description?err.description:'Ticker nicht gefunden';
+        continue;
+      }
       var q=result.indicators.quote[0];
       return{
-        candles:result.timestamp.map(function(ts,i){return{
-          idx:i,
-          date:new Date(ts*1000).toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'2-digit'}),
-          close:q.close[i],open:q.open[i],high:q.high[i],low:q.low[i],volume:q.volume[i]
-        };}).filter(function(d){return d.close!=null;}),
+        candles:result.timestamp.map(function(ts,j){
+          return{
+            idx:j,
+            date:new Date(ts*1000).toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'2-digit'}),
+            close:q.close[j],open:q.open[j],high:q.high[j],low:q.low[j],volume:q.volume[j]
+          };
+        }).filter(function(d){return d.close!=null;}),
         meta:{
           longName:result.meta.longName||result.meta.symbol,
           currency:result.meta.currency,
@@ -400,33 +417,6 @@ async function fetchYF(ticker,range){
     }catch(e){lastErr=e.message;}
   }
   throw new Error(lastErr);
-}
-
-/* ── ISIN Detection & Conversion ── */
-function isISIN(val){
-  return /^[A-Z]{2}[A-Z0-9]{10}$/.test(val);
-}
-
-async function isinToTicker(isin){
-  // OpenFIGI API - free, no key required for basic use
-  const res=await fetch('https://api.openfigi.com/v3/mapping',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify([{idType:'ID_ISIN',idValue:isin}]),
-    signal:AbortSignal.timeout(8000)
-  });
-  if(!res.ok) throw new Error('ISIN-Abfrage fehlgeschlagen (HTTP '+res.status+')');
-  const data=await res.json();
-  const hits=data&&data[0]&&data[0].data;
-  if(!hits||hits.length===0) throw new Error('Keine Börsennotierung für ISIN '+isin+' gefunden');
-  // Prefer XETRA (Germany), then any equity
-  const xetra=hits.find(function(h){return h.exchCode==='GY'||h.exchCode==='XETR';});
-  const equity=hits.find(function(h){return h.securityType==='Common Stock'||h.securityType==='ETP';});
-  const best=xetra||equity||hits[0];
-  if(!best.ticker) throw new Error('Kein Ticker für diese ISIN verfügbar');
-  // Build Yahoo Finance ticker: append .DE for German exchange
-  const suffix=(best.exchCode==='GY'||best.exchCode==='XETR')?'.DE':'';
-  return{ticker:best.ticker+suffix,name:best.name||isin};
 }
 
 /* ── Load ── */
