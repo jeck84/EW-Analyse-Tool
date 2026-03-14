@@ -370,36 +370,38 @@ function isISIN(val){
 }
 
 async function isinToTicker(isin){
-  const figiUrl='https://api.openfigi.com/v3/mapping';
-  const body=JSON.stringify([{idType:'ID_ISIN',idValue:isin}]);
-  const proxyUrls=[
-    'https://corsproxy.io/?'+encodeURIComponent(figiUrl),
-    'https://api.allorigins.win/raw?url='+encodeURIComponent(figiUrl),
+  // Yahoo Finance search API - same proxy as chart data
+  const searchUrl='https://query1.finance.yahoo.com/v1/finance/search?q='
+    +encodeURIComponent(isin)+'&quotesCount=5&newsCount=0&enableFuzzyQuery=false';
+
+  const proxies=[
+    'https://api.allorigins.win/raw?url='+encodeURIComponent(searchUrl),
+    'https://corsproxy.io/?'+encodeURIComponent(searchUrl),
+    'https://thingproxy.freeboard.io/fetch/'+searchUrl,
   ];
-  let data=null;
-  // Try direct first
-  try{
-    const r=await fetch(figiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body,signal:AbortSignal.timeout(8000)});
-    if(r.ok) data=await r.json();
-  }catch(_){}
-  // Try proxies
-  for(let i=0;i<proxyUrls.length&&!data;i++){
+
+  let lastErr='Suche fehlgeschlagen';
+  for(let i=0;i<proxies.length;i++){
     try{
-      const r=await fetch(proxyUrls[i],{method:'POST',headers:{'Content-Type':'application/json'},body,signal:AbortSignal.timeout(10000)});
-      if(!r.ok) continue;
-      const txt=await r.text();
-      if(txt.trim()[0]==='[') data=JSON.parse(txt);
-    }catch(_){}
+      const res=await fetch(proxies[i],{signal:AbortSignal.timeout(10000)});
+      if(!res.ok){lastErr='HTTP '+res.status;continue;}
+      const txt=await res.text();
+      if(!txt||txt.trim()[0]!=='{'){lastErr='Kein JSON vom Proxy';continue;}
+      const json=JSON.parse(txt);
+      const quotes=json&&json.quotes;
+      if(!quotes||!quotes.length){
+        lastErr='Keine Ergebnisse für diese ISIN';
+        continue;
+      }
+      // Prefer XETRA (exchange: GER or XETRA), then any equity
+      const xetra=quotes.find(q=>q.exchDisp==='XETRA'||q.exchange==='GER'||q.exchange==='XETR'||(q.symbol&&q.symbol.endsWith('.DE')));
+      const equity=quotes.find(q=>q.quoteType==='EQUITY');
+      const best=xetra||equity||quotes[0];
+      if(!best||!best.symbol) throw new Error('Kein Ticker gefunden');
+      return{ticker:best.symbol,name:best.longname||best.shortname||isin};
+    }catch(e){lastErr=e.message;}
   }
-  if(!data) throw new Error('ISIN-Auflösung fehlgeschlagen. Bitte Ticker direkt eingeben.');
-  const hits=data[0]&&data[0].data;
-  if(!hits||!hits.length) throw new Error('Keine Börsennotierung für ISIN '+isin+' gefunden.');
-  const xetra=hits.find(h=>h.exchCode==='GY'||h.exchCode==='XETR');
-  const equity=hits.find(h=>h.securityType==='Common Stock'||h.securityType==='ETP');
-  const best=xetra||equity||hits[0];
-  if(!best.ticker) throw new Error('Kein Ticker für diese ISIN verfügbar.');
-  const suffix=(best.exchCode==='GY'||best.exchCode==='XETR')?'.DE':'';
-  return{ticker:best.ticker+suffix,name:best.name||isin};
+  throw new Error(lastErr+'. Bitte Ticker direkt eingeben (z.B. BMW.DE).');
 }
 
 /* ── Fetch (Yahoo Finance via proxy) ── */
