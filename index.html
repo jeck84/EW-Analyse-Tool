@@ -56,7 +56,7 @@ input:focus{border-color:var(--accent)}
   color:var(--accent);letter-spacing:-.02em;margin-right:4px;white-space:nowrap;
 }
 #ticker-input{
-  width:96px;padding:7px 10px;font-size:13px;font-weight:600;
+  width:140px;padding:7px 10px;font-size:13px;font-weight:600;
   text-transform:uppercase;letter-spacing:.05em;
 }
 .btn-load{
@@ -238,7 +238,7 @@ input:focus{border-color:var(--accent)}
   <!-- Topbar -->
   <div class="topbar">
     <span class="logo">~ EW</span>
-    <input id="ticker-input" value="AAPL" placeholder="Ticker"
+    <input id="ticker-input" value="AAPL" placeholder="Ticker / ISIN"
       autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"/>
     <button class="btn-load" id="load-btn" onclick="loadData()">Laden</button>
     <div class="topbar-spacer"></div>
@@ -370,54 +370,97 @@ function updateRangeUI(){
 /* ── Fetch ── */
 async function fetchYF(ticker,range){
   const iv=IV[range]||'1d';
-  const yfUrl=`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker.toUpperCase())}?range=${range}&interval=${iv}&includePrePost=false`;
-  // Try direct first, fall back to proxy
-  let json=null;
-  try{
-    const r=await fetch(yfUrl,{headers:{'Accept':'application/json'},signal:AbortSignal.timeout(8000)});
-    if(r.ok) json=await r.json();
-  }catch(_){}
-  if(!json){
-    const r=await fetch(PROXY+encodeURIComponent(yfUrl),{signal:AbortSignal.timeout(12000)});
-    if(!r.ok) throw new Error(`HTTP ${r.status} — Ticker ungültig?`);
-    const wrapped=await r.json();
-    // corsproxy.io returns {contents: "..."}
-    json=typeof wrapped.contents==='string'?JSON.parse(wrapped.contents):wrapped;
+  const yfUrl='https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(ticker.toUpperCase())+'?range='+range+'&interval='+iv+'&includePrePost=false';
+  const proxies=[
+    function(u){return 'https://api.allorigins.win/raw?url='+encodeURIComponent(u);},
+    function(u){return 'https://corsproxy.io/?'+encodeURIComponent(u);},
+    function(u){return 'https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(u);},
+  ];
+  var lastErr='Keine Verbindung möglich';
+  for(var pi=0;pi<proxies.length;pi++){
+    try{
+      var res=await fetch(proxies[pi](yfUrl),{signal:AbortSignal.timeout(12000)});
+      if(!res.ok){lastErr='HTTP '+res.status;continue;}
+      var json=JSON.parse(await res.text());
+      var result=json&&json.chart&&json.chart.result&&json.chart.result[0];
+      if(!result){lastErr='Ticker nicht gefunden. Bitte prüfen.';continue;}
+      var q=result.indicators.quote[0];
+      return{
+        candles:result.timestamp.map(function(ts,i){return{
+          idx:i,
+          date:new Date(ts*1000).toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'2-digit'}),
+          close:q.close[i],open:q.open[i],high:q.high[i],low:q.low[i],volume:q.volume[i]
+        };}).filter(function(d){return d.close!=null;}),
+        meta:{
+          longName:result.meta.longName||result.meta.symbol,
+          currency:result.meta.currency,
+          exchange:result.meta.exchangeName
+        }
+      };
+    }catch(e){lastErr=e.message;}
   }
-  const result=json?.chart?.result?.[0];
-  if(!result) throw new Error('Keine Kursdaten. Ticker prüfen.');
-  const q=result.indicators.quote[0];
-  return{
-    candles:result.timestamp.map((ts,i)=>({
-      idx:i,
-      date:new Date(ts*1000).toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'2-digit'}),
-      close:q.close[i],open:q.open[i],high:q.high[i],low:q.low[i],volume:q.volume[i]
-    })).filter(d=>d.close!=null),
-    meta:{
-      longName:result.meta.longName||result.meta.symbol,
-      currency:result.meta.currency,
-      exchange:result.meta.exchangeName
-    }
-  };
+  throw new Error(lastErr);
+}
+
+/* ── ISIN Detection & Conversion ── */
+function isISIN(val){
+  return /^[A-Z]{2}[A-Z0-9]{10}$/.test(val);
+}
+
+async function isinToTicker(isin){
+  // OpenFIGI API - free, no key required for basic use
+  const res=await fetch('https://api.openfigi.com/v3/mapping',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify([{idType:'ID_ISIN',idValue:isin}]),
+    signal:AbortSignal.timeout(8000)
+  });
+  if(!res.ok) throw new Error('ISIN-Abfrage fehlgeschlagen (HTTP '+res.status+')');
+  const data=await res.json();
+  const hits=data&&data[0]&&data[0].data;
+  if(!hits||hits.length===0) throw new Error('Keine Börsennotierung für ISIN '+isin+' gefunden');
+  // Prefer XETRA (Germany), then any equity
+  const xetra=hits.find(function(h){return h.exchCode==='GY'||h.exchCode==='XETR';});
+  const equity=hits.find(function(h){return h.securityType==='Common Stock'||h.securityType==='ETP';});
+  const best=xetra||equity||hits[0];
+  if(!best.ticker) throw new Error('Kein Ticker für diese ISIN verfügbar');
+  // Build Yahoo Finance ticker: append .DE for German exchange
+  const suffix=(best.exchCode==='GY'||best.exchCode==='XETR')?'.DE':'';
+  return{ticker:best.ticker+suffix,name:best.name||isin};
 }
 
 /* ── Load ── */
 async function loadData(){
-  const t=document.getElementById('ticker-input').value.trim().toUpperCase();
-  if(!t)return;
-  S.ticker=t; S.data=[]; S.wave=null;
+  var raw=document.getElementById('ticker-input').value.trim().toUpperCase();
+  if(!raw)return;
   document.getElementById('load-btn').disabled=true;
-  showSpin(true);hideErr();
+  showSpin(true,'Lade Daten…');hideErr();
   document.getElementById('sdot').className='sdot loading';
-  document.getElementById('stext').textContent='Lade '+t+'…';
+
+  var t=raw;
   try{
-    const{candles,meta}=await fetchYF(t,S.range);
-    S.data=candles; S.meta=meta;
+    if(isISIN(raw)){
+      document.getElementById('stext').textContent='ISIN wird aufgelöst…';
+      showSpin(true,'ISIN wird aufgelöst…');
+      var resolved=await isinToTicker(raw);
+      t=resolved.ticker;
+      // Show resolved ticker in input
+      document.getElementById('ticker-input').value=t;
+      document.getElementById('stext').textContent='ISIN → '+t+' · Lade Kursdaten…';
+      showSpin(true,'Lade '+t+'…');
+    } else {
+      document.getElementById('stext').textContent='Lade '+t+'…';
+    }
+    S.ticker=t; S.data=[]; S.wave=null;
+    var result=await fetchYF(t,S.range);
+    S.data=result.candles; S.meta=result.meta;
+    // If came from ISIN, keep original ISIN info visible
+    if(isISIN(raw)) S.meta.isin=raw;
     recompute();
   }catch(e){
-    showErr('Ticker nicht gefunden',e.message);
+    showErr(isISIN(raw)?'ISIN nicht gefunden':'Ticker nicht gefunden',e.message);
     document.getElementById('sdot').className='sdot';
-    document.getElementById('stext').textContent='Fehler — Ticker prüfen';
+    document.getElementById('stext').textContent='Fehler — Eingabe prüfen';
   }finally{
     document.getElementById('load-btn').disabled=false;
     showSpin(false);
@@ -495,12 +538,13 @@ function renderPrice(){
   const last=d[d.length-1],prev=d[d.length-2];
   const chg=prev?last.close-prev.close:0,pct=prev?chg/prev.close*100:0;
   const up=chg>=0,col=up?'var(--green)':'var(--red)';
-  document.getElementById('price-sec').innerHTML=`
-    <div class="s-label">Kurs</div>
-    <div style="font-size:11px;color:var(--text2);margin-bottom:3px">${(m?.longName||S.ticker).slice(0,22)}</div>
-    <div class="price-big" style="color:${col}">${last.close.toFixed(2)}</div>
-    <div class="price-chg" style="color:${col}">${up?'+':''}${chg.toFixed(2)} (${up?'+':''}${pct.toFixed(2)}%)</div>
-    <div class="price-meta">${m?.currency||''} · ${m?.exchange||''}</div>`;
+  var isinHint=S.meta&&S.meta.isin?'<div style="font-size:10px;color:var(--text3);margin-top:2px;font-family:var(--mono)">'+S.meta.isin+'</div>':'';
+  document.getElementById('price-sec').innerHTML='<div class="s-label">Kurs</div>'
+    +'<div style="font-size:11px;color:var(--text2);margin-bottom:3px">'+(m&&m.longName?m.longName:S.ticker).slice(0,22)+'</div>'
+    +'<div class="price-big" style="color:'+col+'">'+(last.close.toFixed(2))+'</div>'
+    +'<div class="price-chg" style="color:'+col+'">'+(up?'+':'')+(chg.toFixed(2))+' ('+(up?'+':'')+(pct.toFixed(2))+'%)</div>'
+    +'<div class="price-meta">'+(m&&m.currency?m.currency:'')+' · '+(m&&m.exchange?m.exchange:'')+'</div>'
+    +isinHint;
 }
 
 function renderPattern(){
